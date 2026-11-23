@@ -24,16 +24,34 @@
 | 成环返回环上的层位与记录号 | 内存模拟本批后做 DFS 环检测，409 返回 `cycle`（首尾相同的层位序列）与环上每条边的支持记录号（以本批生效时为准） |
 | 成环或保存失败时保留原记录和关系图 | 任何异常都 `ROLLBACK`；成环时记录写入虽先执行，但随回滚全部撤销 |
 
+## `GET /groups` 全库导出的流式设计
+
+归档时该接口一次取齐全库最简层位图。即使单个层位组很大，也要保证应用内存与
+SQL 查询次数不随输出条目数增长，且慢客户端不拖累数据库。实现见 `app/export.py`
+与 `app/responses.py`：
+
+| 约束 | 实现方式 |
+| --- | --- |
+| 沿用原 JSON 字段与数组顺序 | 两条 `ORDER BY` 与旧 `_load_group` 完全一致，手写发射的 JSON 与 `json.dumps(..., ensure_ascii=False, separators=(",",":"))` 逐字节相同（有测试做新旧实现字节级对比） |
+| SQL 查询次数不随条目数增长 | 固定 **2 条** SELECT：①`strata` 按 `(group_id, stratum_no)` 有序扫描；②`graph_edges LEFT JOIN edge_support` 按 `(group_id, before_no, after_no, record_no)` 有序扫描，无 N+1 |
+| 组内层位/连线/依据记录号来自同一份已提交数据 | 两条游标在**同一连接、同一 `BEGIN` 读事务**内交错归并，共享同一 WAL 快照；扫描期间其他连接提交的现场订正不会混入本次响应，订正可继续正常提交 |
+| 应用额外内存不随条目数增长 | 游标按批 `fetchmany`（每批 256 行，`deque` O(1) 弹出）；层位号与记录号逐条发射、不物化列表；JSON 边生成边写入 `SpooledTemporaryFile`，超过 64KiB 自动落盘，任意时刻堆中只有定长批次与当前行 |
+| 慢/暂停客户端不延长读事务、不妨碍 WAL 回收 | 取数与 JSON 组装**全部完成并 `commit`/关闭连接后**才开始网络发送；客户端只影响磁盘缓冲的重放速度，数据库读事务早已结束，WAL 可随时 checkpoint 回收 |
+| 取数/组装失败返回错误 | 失败发生在首个响应字节之前，异常向上抛出由全局处理器返回 HTTP 500 JSON；缓冲与连接在 `except/finally` 中关闭 |
+| 下载结束或断开后释放资源 | 自定义 `SpooledJSONResponse` 在 `__call__` 的 `finally` 中同步关闭临时文件，正常结束、对端断开导致任务取消都会确定性触发（不依赖 GC） |
+
 ## 目录结构
 
 ```
 app/
-  graph.py    纯图算法：成环检测、弱连通分量、传递归约
-  db.py       SQLite 连接、WAL/外键配置、建表脚本
-  schemas.py  Pydantic 请求/响应模型
-  service.py  事务编排：校验、批次模拟、局部重算、持久化、查询
-  main.py     FastAPI 路由与异常映射
-tests/        pytest 单元测试 + API 端到端测试（20 个用例）
+  graph.py      纯图算法：成环检测、弱连通分量、传递归约
+  db.py         SQLite 连接、WAL/外键配置、建表脚本
+  schemas.py    Pydantic 请求/响应模型
+  service.py    事务编排：校验、批次模拟、局部重算、持久化、查询
+  export.py     /groups 定长内存、固定 SQL、单快照的流式导出器
+  responses.py  资源自释放的流式响应（结束/断开确定性关闭临时文件）
+  main.py       FastAPI 路由与异常映射
+tests/          pytest 单元测试 + API 端到端测试（37 个用例）
 Dockerfile
 docker-compose.yml
 ```
@@ -180,3 +198,10 @@ curl -X POST http://localhost:8000/records/batch \
   持有（`busy_timeout=30s`），其他组的订正可正常排队完成。
 - 批次内所有操作同生共死：任何一步失败或检测到环，事务回滚，库内状态与
   批次开始前完全一致。
+- `GET /groups` 的读事务只覆盖"取数 + 组装"阶段，且在该阶段结束时立即
+  `commit` 并关闭连接；之后向客户端重放磁盘缓冲不再持有任何数据库快照，
+  因此客户端接收慢或暂停既不会延长读事务，也不会妨碍 SQLite 对 WAL 做
+  checkpoint 回收。导出期间现场订正仍可继续提交，只是本次响应保持导出
+  开始时的那份快照。
+- 大响应的临时缓冲落在 `TMPDIR`（compose 中挂为 512MiB tmpfs），下载结束
+  或客户端断开即删除，不写镜像层、不残留宿主磁盘。

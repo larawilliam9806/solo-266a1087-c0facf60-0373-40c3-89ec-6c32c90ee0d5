@@ -7,8 +7,13 @@ services:
       - "8000:8000"
     environment:
       ARCH_DB_PATH: /data/archaeology.db
+      TMPDIR: /tmp
     volumes:
       - strata-data:/data
+    # 大响应缓冲落盘用的临时目录挂为 tmpfs：内存级速度，容器停止即回收，
+    # 不占镜像层、不写宿主磁盘；慢客户端下载期间缓冲也只存在于这里
+    tmpfs:
+      - /tmp:noexec,nosuid,size=512m
     restart: unless-stopped
 
 volumes:

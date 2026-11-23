@@ -13,9 +13,9 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
-from . import graph
+from . import export, graph
 from .db import db_session, init_db
-from .schemas import BatchRequest, GroupOut
+from .schemas import BatchRequest
 
 
 class CycleConflict(Exception):
@@ -365,6 +365,16 @@ def list_groups(db_path: str | None = None) -> list[dict]:
             )
         ]
         return [_load_group(conn, gid) for gid in ids]
+
+
+def open_groups_export(db_path: str | None = None):
+    """打开 /groups 的流式导出缓冲（定长内存、固定 SQL 数、单快照）。
+
+    返回一个已 seek 到开头的类文件对象，调用方（路由层）负责在响应
+    结束或客户端断开后 close()。取数/组装失败时本函数内部已释放全部
+    资源并向上抛出异常。
+    """
+    return export.export_groups_spool(db_path)
 
 
 def list_strata(db_path: str | None = None) -> list[dict]:

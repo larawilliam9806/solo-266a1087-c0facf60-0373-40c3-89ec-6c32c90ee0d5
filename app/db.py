@@ -52,7 +52,15 @@ CREATE TABLE IF NOT EXISTS edge_support (
 );
 
 CREATE INDEX IF NOT EXISTS idx_records_active ON records (active);
-CREATE INDEX IF NOT EXISTS idx_strata_group ON strata (group_id);
+-- 覆盖 GET /groups 的 strata 有序扫描：同组内层位号有序
+CREATE INDEX IF NOT EXISTS idx_strata_group_stratum
+    ON strata (group_id, stratum_no);
+-- 覆盖边流的排序与连接：按组、端点有序，连线依据记录号随索引有序，
+-- 使 graph_edges LEFT JOIN edge_support 直接按索引顺序输出，免临时 B-TREE
+CREATE INDEX IF NOT EXISTS idx_edge_support_lookup
+    ON edge_support (before_no, after_no, record_no);
+CREATE INDEX IF NOT EXISTS idx_graph_edges_group
+    ON graph_edges (group_id, before_no, after_no);
 """
 
 

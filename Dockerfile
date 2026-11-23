@@ -2,16 +2,20 @@ FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    ARCH_DB_PATH=/data/archaeology.db
+    ARCH_DB_PATH=/data/archaeology.db \
+    TMPDIR=/tmp
 
 WORKDIR /app
+
+# 大响应的 SpooledTemporaryFile 超过内存阈值后落到 TMPDIR，
+# 容器内 /tmp 默认可写；显式声明便于运维改用 tmpfs 挂载
+RUN mkdir -p /data /tmp
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
-RUN mkdir -p /data
 VOLUME ["/data"]
 
 EXPOSE 8000

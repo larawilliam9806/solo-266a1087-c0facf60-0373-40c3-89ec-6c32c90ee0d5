@@ -1,12 +1,15 @@
 """FastAPI 入口：考古层位先后关系图供数接口。"""
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 from . import service
+from .responses import SpooledJSONResponse
 from .schemas import (
     BatchRequest,
     BatchResponse,
@@ -14,6 +17,11 @@ from .schemas import (
     StrataRegisterRequest,
     StrataRegisterResponse,
 )
+
+logger = logging.getLogger("archaeology")
+
+# 网络重放块大小：与取数/组装阶段无关，仅控制每次 send() 的字节数
+_REPLAY_CHUNK_SIZE = 64 * 1024
 
 
 @asynccontextmanager
@@ -50,6 +58,13 @@ def _cycle_handler(_request: Request, exc: service.CycleConflict):
     )
 
 
+@app.exception_handler(Exception)
+def _unexpected_handler(request: Request, exc: Exception) -> JSONResponse:
+    """取数或组装失败（响应尚未开始发送时）统一返回 JSON 错误。"""
+    logger.exception("处理 %s 时发生未预期错误: %s", request.url.path, exc)
+    return JSONResponse(status_code=500, content={"detail": "内部错误，导出失败"})
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
@@ -79,9 +94,19 @@ def get_records(
     return service.list_records(active_only=active_only)
 
 
-@app.get("/groups", response_model=list[GroupOut])
-def get_groups() -> list[GroupOut]:
-    return service.list_groups()
+@app.get("/groups")
+async def get_groups() -> SpooledJSONResponse:
+    """全库层位组最简层位图。
+
+    取数与 JSON 组装在线程池中完成（SQLite 调用为同步阻塞），期间使用
+    定长内存与固定 SQL 数；整个读取处于单读事务的同一快照内。组装完成、
+    数据库连接关闭后才返回响应重放磁盘缓冲，因此客户端接收慢或暂停不会
+    延长读事务，也不会妨碍 WAL 回收。取数/组装失败时尚未发送任何响应
+    字节，异常向上抛出由全局异常处理器转为 500；下载结束或客户端断开时
+    由 SpooledJSONResponse 确定性地关闭缓冲、释放临时文件。
+    """
+    spool = await run_in_threadpool(service.open_groups_export)
+    return SpooledJSONResponse(spool, chunk_size=_REPLAY_CHUNK_SIZE)
 
 
 @app.get("/groups/by-stratum/{stratum_no}", response_model=GroupOut)
